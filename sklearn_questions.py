@@ -61,6 +61,11 @@ from sklearn.utils.validation import validate_data
 from sklearn.metrics.pairwise import pairwise_distances
 
 
+# ----------------------AJOUT PERSONNEL-----------------------
+from sklearn.utils.multiclass import type_of_target
+# ------------------------------------------------------------
+
+
 class KNearestNeighbors(ClassifierMixin, BaseEstimator):
     """KNearestNeighbors classifier."""
 
@@ -82,6 +87,27 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         self : instance of KNearestNeighbors
             The current instance of the classifier
         """
+        if not isinstance(self.n_neighbors, int) or self.n_neighbors <= 0:
+            raise ValueError("n_neighbors must be a positive integer.")
+
+        X, y = validate_data(self, X, y, reset=True)
+
+        target_type = type_of_target(y)
+        if target_type not in ("binary", "multiclass"):
+            raise ValueError(f"Unknown label type: {target_type}")
+
+        n_samples = X.shape[0]
+        if n_samples == 0:
+            raise ValueError("X must contain at least one sample.")
+        if self.n_neighbors > n_samples:
+            raise ValueError(f"n_samples={n_samples}")
+
+        self.X_ = X
+        self.y_ = y
+
+        self.classes_, y_encoded = np.unique(y, return_inverse=True)
+        self.y_encoded_ = y_encoded
+
         return self
 
     def predict(self, X):
@@ -97,8 +123,21 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         y : ndarray, shape (n_test_samples,)
             Predicted class labels for each test data sample.
         """
-        y_pred = np.zeros(X.shape[0])
-        return y_pred
+        check_is_fitted(self, attributes=["X_"])
+        X = validate_data(self, X, reset=False)
+
+        distances = pairwise_distances(X, self.X_, metric="euclidean")
+        k = self.n_neighbors
+
+        nn_idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+
+        y_pred = np.empty(X.shape[0], dtype=int)
+        for i in range(X.shape[0]):
+            neigh = self.y_encoded_[nn_idx[i]]
+            counts = np.bincount(neigh, minlength=self.classes_.shape[0])
+            y_pred[i] = int(np.argmax(counts))
+
+        return self.classes_[y_pred]
 
     def score(self, X, y):
         """Calculate the score of the prediction.
@@ -115,7 +154,10 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         score : float
             Accuracy of the model computed for the (X, y) pairs.
         """
-        return 0.
+        X, y = validate_data(self, X, y, reset=False)
+
+        y_pred = self.predict(X)
+        return float(np.mean(y_pred == y))
 
 
 class MonthlySplit(BaseCrossValidator):
@@ -155,7 +197,23 @@ class MonthlySplit(BaseCrossValidator):
         n_splits : int
             The number of splits.
         """
-        return 0
+        if self.time_col == "index":
+            if not hasattr(X, "index"):
+                raise ValueError("DatetimeIndex needed when time_col='index'")
+            times = X.index
+        else:
+            if not isinstance(X, pd.DataFrame):
+                raise ValueError("X must be a pandas DataFrame")
+            if self.time_col not in X.columns:
+                raise ValueError("time_col not found in X.")
+            times = X[self.time_col]
+
+        if not pd.api.types.is_datetime64_any_dtype(times):
+            raise ValueError("time column/index must be datetime.")
+
+        months = pd.Series(times).dt.to_period("M")
+        n_months = months.dropna().unique().shape[0]
+        return max(int(n_months) - 1, 0)
 
     def split(self, X, y, groups=None):
         """Generate indices to split data into training and test set.
@@ -178,11 +236,31 @@ class MonthlySplit(BaseCrossValidator):
             The testing set indices for that split.
         """
 
-        n_samples = X.shape[0]
+        # n_samples = X.shape[0]
         n_splits = self.get_n_splits(X, y, groups)
+
+        if self.time_col == "index":
+            if not hasattr(X, "index"):
+                raise ValueError("X must have a DatetimeIndex")
+            times = X.index
+        else:
+            if not isinstance(X, pd.DataFrame):
+                raise ValueError("X must be a pandas DataFrame")
+            if self.time_col not in X.columns:
+                raise ValueError("time_col not found in X.")
+            times = X[self.time_col]
+
+        if not pd.api.types.is_datetime64_any_dtype(times):
+            raise ValueError("time column/index must be datetime.")
+
+        months = pd.Series(times).dt.to_period("M")
+        unique_months = np.sort(months.dropna().unique())
+
         for i in range(n_splits):
-            idx_train = range(n_samples)
-            idx_test = range(n_samples)
-            yield (
-                idx_train, idx_test
-            )
+            train_month = unique_months[i]
+            test_month = unique_months[i + 1]
+
+            idx_train = np.flatnonzero((months == train_month).to_numpy())
+            idx_test = np.flatnonzero((months == test_month).to_numpy())
+
+            yield idx_train, idx_test
